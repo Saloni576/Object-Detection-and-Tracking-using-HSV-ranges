@@ -64,6 +64,12 @@ start_tracking_frame = 101  # tracking starts here
 def euclidean_dist(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
+def crop_image(img):
+    # Fixed bounding box (same as in img_crop.py)
+    x_min, y_min = 212, 73
+    x_max, y_max = 523, 430
+    return img[y_min:y_max, x_min:x_max]
+
 # Loop over files
 for fname in all_pngs:
     image_path = os.path.join(input_folder, fname)
@@ -72,6 +78,7 @@ for fname in all_pngs:
     if image is None:
         print(f"Skipping {fname}, could not load.")
         continue
+    image = crop_image(image)
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     kernel = np.ones((3, 3), np.uint8)
