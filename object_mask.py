@@ -70,6 +70,30 @@ def crop_image(img):
     x_max, y_max = 523, 430
     return img[y_min:y_max, x_min:x_max]
 
+def union_significant_contours(binary_mask: np.ndarray, min_area: int = 65, area_frac_keep: float = 0.35):
+    """
+    Keep all contours whose area >= area_frac_keep * largest_area (after min_area filter),
+    and return a single 0/255 mask that is the union of those contours.
+    Returns None if nothing valid.
+    """
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    # remove tiny noise
+    contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not contours:
+        return None
+
+    contours.sort(key=cv2.contourArea, reverse=True)
+    largest = cv2.contourArea(contours[0])
+    keep = [c for c in contours if cv2.contourArea(c) >= area_frac_keep * largest]
+    if not keep:
+        keep = [contours[0]]
+
+    out = np.zeros_like(binary_mask)
+    cv2.drawContours(out, keep, -1, 255, thickness=cv2.FILLED)
+    return out
+
 # Loop over files
 for fname in all_pngs:
     image_path = os.path.join(input_folder, fname)
@@ -93,14 +117,10 @@ for fname in all_pngs:
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            min_area = 65  # adjust as needed
-            contours = [c for c in contours if cv2.contourArea(c) >= min_area]
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            mask_red_final = np.zeros_like(mask_red)
-            cv2.drawContours(mask_red_final, [c], -1, 255, -1)
+
+        # NEW: keep union of significant contours (handles split halves)
+        mask_red_final = union_significant_contours(mask_red, min_area=65, area_frac_keep=0.35)
+        if mask_red_final is not None:
             masks["red"] = mask_red_final
 
     # --- Green (largest object) ---
@@ -108,14 +128,10 @@ for fname in all_pngs:
         mask_green = cv2.inRange(hsv, np.array([40, 70, 70]), np.array([70, 150, 190]))
         mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
         mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            min_area = 65  # adjust as needed
-            contours = [c for c in contours if cv2.contourArea(c) >= min_area]
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            mask_green_final = np.zeros_like(mask_green)
-            cv2.drawContours(mask_green_final, [c], -1, 255, -1)
+
+        # NEW: keep union of significant contours (handles split halves)
+        mask_green_final = union_significant_contours(mask_green, min_area=65, area_frac_keep=0.35)
+        if mask_green_final is not None:
             masks["green"] = mask_green_final
 
     # --- Gray (largest object) ---
