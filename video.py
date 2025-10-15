@@ -41,11 +41,26 @@ def main():
     out = cv2.VideoWriter(args.output, fourcc, args.fps, (width, height))
 
     # Write frames with progress bar
-    for frame_path in tqdm(frames, desc="Writing frames", unit="frame"):
+    for idx, frame_path in enumerate(tqdm(frames, desc="Writing frames", unit="frame")):
         frame = cv2.imread(str(frame_path))
         if frame is None:
             print(f"Warning: Skipping unreadable frame {frame_path}")
             continue
+
+        # ======== Add frame number / name on the video =========
+        text = f"Frame: {idx + 1} ({frame_path.name})"
+        cv2.putText(
+            frame,
+            text,
+            (30, 50),  # Position (x, y)
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,        # Font scale
+            (0, 255, 255),  # Color (BGR) — yellow
+            2,          # Thickness
+            cv2.LINE_AA
+        )
+        # =======================================================
+
         out.write(frame)
 
     out.release()
