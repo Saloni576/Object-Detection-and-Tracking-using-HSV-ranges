@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 # hover over image and get hsv values
 
 # Load image
-image = cv2.imread("14/obj/frame_000734.png")
+image = cv2.imread("../../first_pick/14_out/object/frame_000061.png")
 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
