@@ -248,12 +248,12 @@ for fname in all_pngs:
                 d1 = euclidean_dist((x1, y1), (x5, y5))
                 d2 = euclidean_dist((x2, y2), (x5, y5))
                 if d1 < d2:
-                    label = "yellow_1" # wrong (here it should assign label of (x1, y1))
-                    # prev_two_yellow_centroids = ((x5, y5), (x2, y2))
+                    label = "yellow_1"
+                    prev_two_yellow_centroids = ((x5, y5), (x2, y2))
                     cv2.circle(overlay_debug, (x5, y5), 5, (255, 0, 0), -1)
                 else:
                     label = "yellow_2"
-                    # prev_two_yellow_centroids = ((x1, y1), (x5, y5))
+                    prev_two_yellow_centroids = ((x1, y1), (x5, y5))
                     cv2.circle(overlay_debug, (x5, y5), 5, (255, 0, 255), -1)
 
                 mask_final = np.zeros_like(mask_yellow)
