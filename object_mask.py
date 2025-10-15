@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 import csv
 from scipy.spatial import distance as dist
 import math
+import cv2.aruco as aruco
 
 # ----------------- Argument Parser -----------------
 parser = argparse.ArgumentParser(description="Detect objects and save masks")
@@ -64,10 +65,53 @@ start_tracking_frame = 101  # tracking starts here
 def euclidean_dist(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-def crop_image(img):
-    # Fixed bounding box (same as in img_crop.py)
-    x_min, y_min = 212, 73
-    x_max, y_max = 523, 430
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+detector = aruco.ArucoDetector(aruco_dict, parameters)
+
+global_crop_box = None  # cached bounding box
+
+def detect_and_cache_crop_box(img: np.ndarray):
+    """Detect 3-4 ArUco markers, compute bounding box, and cache it."""
+    global global_crop_box
+    if global_crop_box is not None:
+        return global_crop_box
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
+    if ids is None or len(ids) < 3 or len(ids) > 4:
+        return None
+
+    selected_points = []
+    for i, corner in enumerate(corners):
+        marker_id = ids[i][0]
+        pts = corner.reshape((4, 2))
+        if marker_id in [1, 2, 3]:
+            sel = pts[0]
+        elif marker_id == 0:
+            sel = pts[1]
+        else:
+            sel = None
+        if sel is not None:
+            selected_points.append(sel)
+
+    if len(selected_points) < 2:
+        return None
+
+    pts = np.array(selected_points, dtype=int)
+    x_min, y_min = np.min(pts, axis=0)
+    x_max, y_max = np.max(pts, axis=0)
+    global_crop_box = (x_min, y_min, x_max, y_max)
+    print(f"✅ Cached ArUco crop box: {global_crop_box}")
+    return global_crop_box
+
+
+def crop_image(img: np.ndarray) -> np.ndarray:
+    """Crop color frame according to detected/cached ArUco box."""
+    box = detect_and_cache_crop_box(img)
+    if box is None:
+        return img
+    x_min, y_min, x_max, y_max = box
     return img[y_min:y_max, x_min:x_max]
 
 # Loop over files
@@ -204,12 +248,12 @@ for fname in all_pngs:
                 d1 = euclidean_dist((x1, y1), (x5, y5))
                 d2 = euclidean_dist((x2, y2), (x5, y5))
                 if d1 < d2:
-                    label = "yellow_1"
-                    prev_two_yellow_centroids = ((x5, y5), (x2, y2))
+                    label = "yellow_1" # wrong (here it should assign label of (x1, y1))
+                    # prev_two_yellow_centroids = ((x5, y5), (x2, y2))
                     cv2.circle(overlay_debug, (x5, y5), 5, (255, 0, 0), -1)
                 else:
                     label = "yellow_2"
-                    prev_two_yellow_centroids = ((x1, y1), (x5, y5))
+                    # prev_two_yellow_centroids = ((x1, y1), (x5, y5))
                     cv2.circle(overlay_debug, (x5, y5), 5, (255, 0, 255), -1)
 
                 mask_final = np.zeros_like(mask_yellow)
