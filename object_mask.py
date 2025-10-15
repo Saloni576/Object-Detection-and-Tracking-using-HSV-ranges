@@ -138,14 +138,34 @@ def union_significant_contours(binary_mask: np.ndarray, min_area: int = 65, area
     cv2.drawContours(out, keep, -1, 255, thickness=cv2.FILLED)
     return out
 
-# Loop over files
+# ======== Detect crop region from ArUco markers first ========
+global_crop_box = None
+print("🔍 Searching for ArUco markers to define crop region...")
+
+for fname in all_pngs:
+    test_path = os.path.join(input_folder, fname)
+    test_img = cv2.imread(test_path)
+    if test_img is None:
+        continue
+    box = detect_and_cache_crop_box(test_img)
+    if box is not None:
+        print(f"✅ Crop region detected from {fname}: {box}")
+        break
+
+if global_crop_box is None:
+    print("⚠️ No ArUco markers detected — proceeding without cropping.")
+else:
+    print(f"📦 Using cached crop region: {global_crop_box}")
+
+# ======== Now begin normal processing loop ========
 for fname in all_pngs:
     image_path = os.path.join(input_folder, fname)
-
     image = cv2.imread(image_path)
     if image is None:
         print(f"Skipping {fname}, could not load.")
         continue
+
+    # Apply cached crop region if available
     image = crop_image(image)
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
