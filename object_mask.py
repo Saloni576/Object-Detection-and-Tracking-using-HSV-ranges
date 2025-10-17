@@ -157,6 +157,20 @@ if global_crop_box is None:
 else:
     print(f"📦 Using cached crop region: {global_crop_box}")
 
+# --- Save crop box details to mask.txt ---
+mask_txt_path = os.path.join(mask_dir, "mask.txt")
+with open(mask_txt_path, "w") as f:
+    if global_crop_box is None:
+        f.write("No crop region detected.\n")
+    else:
+        x_min, y_min, x_max, y_max = global_crop_box
+        f.write(f"Crop Box Coordinates:\n")
+        f.write(f"x_min={x_min}\n")
+        f.write(f"y_min={y_min}\n")
+        f.write(f"x_max={x_max}\n")
+        f.write(f"y_max={y_max}\n")
+print(f"📝 Crop region info saved to {mask_txt_path}")
+
 # ======== Now begin normal processing loop ========
 for fname in all_pngs:
     image_path = os.path.join(input_folder, fname)
@@ -183,7 +197,7 @@ for fname in all_pngs:
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
 
         # NEW: keep union of significant contours (handles split halves)
-        mask_red_final = union_significant_contours(mask_red, min_area=65, area_frac_keep=0.35)
+        mask_red_final = union_significant_contours(mask_red, min_area=80, area_frac_keep=0.35)
         if mask_red_final is not None:
             masks["red"] = mask_red_final
 
@@ -194,7 +208,7 @@ for fname in all_pngs:
         mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
 
         # NEW: keep union of significant contours (handles split halves)
-        mask_green_final = union_significant_contours(mask_green, min_area=65, area_frac_keep=0.35)
+        mask_green_final = union_significant_contours(mask_green, min_area=80, area_frac_keep=0.35)
         if mask_green_final is not None:
             masks["green"] = mask_green_final
 
@@ -407,10 +421,36 @@ with open(args.log, "w") as f:
 
 print(f"\nLog written to {args.log}")
 
-# --- Save CSV if requested ---
+# --- Save CSV in (filename, red, green, gray, yellow_1, yellow_2, gold) format ---
 if args.csv:
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(args.csv), exist_ok=True)
+
+    # Define desired order of color columns
+    color_columns = ["red", "green", "gray", "yellow_1", "yellow_2", "gold"]
+
+    # Group results by filename
+    grouped = {}
+    for row in csv_rows:
+        fname = row["filename"]
+        color = row["color"]
+        if fname not in grouped:
+            grouped[fname] = {}
+        # Compute center
+        cx = row["x"] + row["width"] // 2
+        cy = row["y"] + row["height"] // 2
+        grouped[fname][color] = f"({cx},{cy},{row['width']},{row['height']})"
+
+    # Write new CSV
     with open(args.csv, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=["filename", "color", "x", "y", "width", "height", "area"])
+        fieldnames = ["filename"] + color_columns
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(csv_rows)
-    print(f"CSV written to {args.csv}")
+
+        for fname in sorted(grouped.keys()):
+            row_data = {"filename": fname}
+            for col in color_columns:
+                row_data[col] = grouped[fname].get(col, "")
+            writer.writerow(row_data)
+
+    print(f"✅ CSV written to {args.csv} with compact bounding box format.")
