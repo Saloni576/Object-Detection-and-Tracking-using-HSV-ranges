@@ -121,7 +121,7 @@ def depth_to_mm(depth_raw: np.ndarray):
     return (depth_raw.astype(np.float32) * DEPTH_UNITS * 1000.0)
 
 def compute_object_depth_stats(depth_mm: np.ndarray, mask: np.ndarray) -> Tuple[float, float, float]:
-    """Return (z_min, z_max, z_com) in mm, or (None,None,None) if no valid pixels."""
+    """Return (z_min, z_max, z_median) in mm, or (None,None,None) if no valid pixels."""
     valid = (mask > 0) & (depth_mm > 0)
     if not np.any(valid):
         return None, None, None
@@ -131,8 +131,8 @@ def compute_object_depth_stats(depth_mm: np.ndarray, mask: np.ndarray) -> Tuple[
         return None, None, None
     z_min = float(np.min(vals))
     z_max = float(np.max(vals))
-    z_com = (z_min + z_max) / 2.0
-    return z_min, z_max, z_com
+    z_median = float(np.median(vals))  # <-- changed from midpoint to median
+    return z_min, z_max, z_median
 
 def colorize_depth_mm(depth_mm: np.ndarray, clip_min: float = None, clip_max: float = None):
     """Depth (mm) -> 3-channel color image for visualization."""
