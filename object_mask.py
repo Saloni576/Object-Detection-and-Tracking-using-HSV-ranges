@@ -409,17 +409,26 @@ for fname in all_pngs:
 
     print(f"Processed {fname} | Detections: {num_detections}")
 
-# Write summary log
-with open(args.log, "w") as f:
-    f.write("Detection Summary (frames vs. number of objects):\n")
-    for num_objs in sorted(frame_counts.keys()):
-        f.write(f"{num_objs} objects: {frame_counts[num_objs]} frames\n")
-    if args.num is not None:
-        f.write(f"\nFrames with exactly {args.num} objects detected:\n")
-        for frame in frames_with_num[args.num]:
-            f.write(frame + "\n")
+# --- Write summary log safely ---
+if args.log:
+    # Ensure log directory exists
+    log_dir = os.path.dirname(args.log)
+    if log_dir:  # only create if a folder path is given
+        os.makedirs(log_dir, exist_ok=True)
 
-print(f"\nLog written to {args.log}")
+    # Write log file
+    with open(args.log, "w") as f:
+        f.write("Detection Summary (frames vs. number of objects):\n")
+        for num_objs in sorted(frame_counts.keys()):
+            f.write(f"{num_objs} objects: {frame_counts[num_objs]} frames\n")
+        if args.num is not None:
+            f.write(f"\nFrames with exactly {args.num} objects detected:\n")
+            for frame in frames_with_num[args.num]:
+                f.write(frame + "\n")
+
+    print(f"\n✅ Log written to {args.log}")
+else:
+    print("\n⚠️ No --log path provided, skipping log file.")
 
 # --- Save CSV in (filename, red, green, gray, yellow_1, yellow_2, gold) format ---
 if args.csv:
