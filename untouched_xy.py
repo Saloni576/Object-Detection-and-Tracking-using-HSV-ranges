@@ -178,9 +178,9 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
     }
 
     objects = list(circle_colors.keys())
-    circle_radius = 8
+    circle_radius = 6
     start_x = 20
-    spacing = 55
+    spacing = 40
     baseline_y = 50  # dots just below frame number
 
     for fname in frame_files:
@@ -224,8 +224,8 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
                 cv2.circle(overlay, (cx, cy), circle_radius, color, 2)   # empty = moving
 
             # Optional: label below circle
-            cv2.putText(overlay, obj, (cx - 20, cy + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(overlay, obj, (cx - 20, cy + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
 
         out.write(overlay)
 
@@ -273,4 +273,18 @@ if __name__ == "__main__":
         video_name=args.video_name
     )
 
-    print_untouched_intervals(untouched_list)
+    # Save untouched intervals to file
+    output_txt_path = os.path.join(args.output_dir, "untouched_intervals_xy.txt")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    with open(output_txt_path, "w", encoding="utf-8") as f:
+        f.write("📌 Untouched intervals per object:\n")
+        for obj, intervals in untouched_list.items():
+            if not intervals:
+                f.write(f"{obj}: None\n")
+                continue
+            ranges = [f"[{start}, {end}]" for start, end in intervals]
+            f.write(f"{obj}: {', '.join(ranges)}\n")
+
+    # print_untouched_intervals(untouched_list)
+    print(f"\n📝 Untouched intervals saved to: {output_txt_path}")
