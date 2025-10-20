@@ -8,10 +8,11 @@ Takes:
  - mask_dir: folder with subfolders: red, green, gray, yellow_1, yellow_2
    each containing masks named same as frames (frame_*.png) or any matching basename
 
-Produces in output_dir:
- - combined_side_by_side.mp4  (color | depth_colorized) preview video with mask overlays
- - depth_only_masked.mp4      (depth_colorized) video with overlays
- - depths.csv                 CSV with per-frame per-object z in mm (min, max, com) and mean_com_mm
+Produces:
+ - depths.csv in --out_csv directory
+ - Videos ONLY if --out_video is provided:
+     • combined_side_by_side.mp4  (color | depth_colorized) preview video with mask overlays
+     • depth_only_masked.mp4      (depth_colorized) video with overlays
 
 Preview appears while processing. Press 'q' to quit early (video/files remain).
 """
@@ -152,17 +153,21 @@ def draw_mask_overlay(img: np.ndarray, mask: np.ndarray, color=(0,255,255), alph
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Compute per-object depth (Z in mm) using masks and depth frames; make preview videos and CSV.")
+    parser = argparse.ArgumentParser(
+        description="Compute per-object depth (Z in mm) using masks and depth frames; optional preview videos and CSV."
+    )
     parser.add_argument("--col_dir", required=True)
     parser.add_argument("--dep_dir", required=True)
     parser.add_argument("--mask_dir", required=True)
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--out_csv", required=True, help="Directory where depths.csv will be created")
+    parser.add_argument("--out_video", default=None, help="Directory to save videos; if omitted, videos are NOT saved")
     parser.add_argument("--fps", type=int, default=FPS)
     parser.add_argument("--show_preview", action="store_true")
     parser.add_argument("--video_codec", default=VIDEO_CODEC)
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Ensure the CSV directory exists
+    os.makedirs(args.out_csv, exist_ok=True)
 
     # Load crop box from mask.txt
     parse_crop_box_from_mask(args.mask_dir)
@@ -182,23 +187,34 @@ def main():
         print("No color frames found in", args.col_dir)
         return
 
-    csv_path = os.path.join(args.output_dir, "depths.csv")
-    csv_fieldnames = ["frame"]
-    for key in mask_subs.keys():
-        csv_fieldnames += [f"{key}_min_mm", f"{key}_max_mm", f"{key}_com_mm"]
-    csv_fieldnames += ["mean_com_mm"]
+    # CSV path (separate from videos)
+    csv_path = os.path.join(args.out_csv, "depths.csv")
 
+    # Prepare frame geometry from a sample color frame
     sample_color = cv2.imread(os.path.join(args.col_dir, col_files[0]))
     sample_color = crop_color_frame(sample_color)
     h, w = sample_color.shape[:2]
     combined_w = w * 2
 
-    fourcc = cv2.VideoWriter_fourcc(*args.video_codec)
-    combined_path = os.path.join(args.output_dir, "combined_side_by_side.mp4")
-    depth_only_path = os.path.join(args.output_dir, "depth_only_masked.mp4")
+    # Optional video writers (created only if --out_video is provided)
+    vw_combined = None
+    vw_depth = None
+    combined_path = None
+    depth_only_path = None
 
-    vw_combined = cv2.VideoWriter(combined_path, fourcc, args.fps, (combined_w, h))
-    vw_depth = cv2.VideoWriter(depth_only_path, fourcc, args.fps, (w, h))
+    if args.out_video:
+        os.makedirs(args.out_video, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*args.video_codec)
+        combined_path = os.path.join(args.out_video, "combined_side_by_side.mp4")
+        depth_only_path = os.path.join(args.out_video, "depth_only_masked.mp4")
+        vw_combined = cv2.VideoWriter(combined_path, fourcc, args.fps, (combined_w, h))
+        vw_depth = cv2.VideoWriter(depth_only_path, fourcc, args.fps, (w, h))
+
+    # Prepare CSV
+    csv_fieldnames = ["frame"]
+    for key in mask_subs.keys():
+        csv_fieldnames += [f"{key}_min_mm", f"{key}_max_mm", f"{key}_com_mm"]
+    csv_fieldnames += ["mean_com_mm"]
 
     with open(csv_path, "w", newline="") as csv_file:
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
@@ -236,19 +252,21 @@ def main():
             overlay_color = color.copy()
             overlay_depth = colorize_depth_mm(depth_mm)
             overlay_colors = {
-                "red": (0,0,255),
-                "green": (0,255,0),
-                "gray": (255,0,0),
-                "yellow_1": (0,255,255),
-                "yellow_2": (0,128,255),
-                "gold": (0,215,255)
+                "red": (0, 0, 255),
+                "green": (0, 255, 0),
+                "gray": (255, 0, 0),
+                "yellow_1": (0, 255, 255),
+                "yellow_2": (0, 128, 255),
+                "gold": (0, 215, 255)
             }
 
             for key, sub in mask_subs.items():
-                mask_path = find_matching_file(basename, os.path.join(args.mask_dir, sub),
-                                               [".png",".jpg",".jpeg",".tif",".tiff"])
-                mask = safe_read_mask(mask_path, (h,w))
-                zmin,zmax,zcom = compute_object_depth_stats(depth_mm, mask)
+                mask_path = find_matching_file(
+                    basename, os.path.join(args.mask_dir, sub),
+                    [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+                )
+                mask = safe_read_mask(mask_path, (h, w))
+                zmin, zmax, zcom = compute_object_depth_stats(depth_mm, mask)
                 row[f"{key}_min_mm"] = "" if zmin is None else f"{zmin:.3f}"
                 row[f"{key}_max_mm"] = "" if zmax is None else f"{zmax:.3f}"
                 row[f"{key}_com_mm"] = "" if zcom is None else f"{zcom:.3f}"
@@ -256,15 +274,23 @@ def main():
                     com_vals.append(zcom)
 
                 if np.any(mask):
-                    overlay_color = draw_mask_overlay(overlay_color, mask, color=overlay_colors.get(key,(0,255,255)), alpha=0.35)
-                    overlay_depth = draw_mask_overlay(overlay_depth, mask, color=overlay_colors.get(key,(0,255,255)), alpha=0.35)
+                    overlay_color = draw_mask_overlay(
+                        overlay_color, mask, color=overlay_colors.get(key, (0, 255, 255)), alpha=0.35
+                    )
+                    overlay_depth = draw_mask_overlay(
+                        overlay_depth, mask, color=overlay_colors.get(key, (0, 255, 255)), alpha=0.35
+                    )
 
             row["mean_com_mm"] = "" if not com_vals else f"{np.mean(com_vals):.3f}"
             csv_writer.writerow(row)
 
             combined = np.hstack((overlay_color, overlay_depth))
-            vw_combined.write(combined)
-            vw_depth.write(overlay_depth)
+
+            # Write videos only if writers are enabled
+            if vw_combined is not None:
+                vw_combined.write(combined)
+            if vw_depth is not None:
+                vw_depth.write(overlay_depth)
 
             if args.show_preview:
                 cv2.imshow("Preview (q to quit)", combined)
@@ -274,15 +300,23 @@ def main():
             if idx % 50 == 0:
                 print(f"Processed {idx}/{len(col_files)} frames...")
 
-    vw_combined.release()
-    vw_depth.release()
+    # Release writers only if they were created
+    if vw_combined is not None:
+        vw_combined.release()
+    if vw_depth is not None:
+        vw_depth.release()
     if args.show_preview:
         cv2.destroyAllWindows()
 
-    print("Done. Outputs saved to:", args.output_dir)
-    print(" -", combined_path)
-    print(" -", depth_only_path)
+    print("Done.")
+    print("CSV:")
     print(" -", csv_path)
+    if args.out_video:
+        print("Videos:")
+        print(" -", combined_path)
+        print(" -", depth_only_path)
+    else:
+        print("Videos: (not saved; --out_video not provided)")
 
 
 if __name__ == "__main__":
