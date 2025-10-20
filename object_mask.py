@@ -138,22 +138,46 @@ def union_significant_contours(binary_mask: np.ndarray, min_area: int = 65, area
     cv2.drawContours(out, keep, -1, 255, thickness=cv2.FILLED)
     return out
 
-# ======== Detect crop region from ArUco markers first ========
+# ======== Detect crop region from ArUco markers (100→50, else 101→end) ========
 global_crop_box = None
 print("🔍 Searching for ArUco markers to define crop region...")
 
-for fname in all_pngs:
-    test_path = os.path.join(input_folder, fname)
-    test_img = cv2.imread(test_path)
+def _parse_frame_num(fname: str):
+    m = re.search(r"frame_(\d+)\.png$", fname, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+# Prepare list [(idx, fname, num)] restricted to files that match the pattern
+annot = [(i, f, _parse_frame_num(f)) for i, f in enumerate(all_pngs)]
+annot = [t for t in annot if t[2] is not None]
+
+# Phase 1: check frames 100 ↓ to 50 (inclusive)
+phase1 = [t for t in annot if 50 <= t[2] <= 100]
+phase1.sort(key=lambda x: x[2], reverse=True)  # 100, 99, …, 50
+
+for _, fname, num in phase1:
+    test_img = cv2.imread(os.path.join(input_folder, fname))
     if test_img is None:
         continue
-    box = detect_and_cache_crop_box(test_img)
+    box = detect_and_cache_crop_box(test_img)  # still requires exactly 3 or 4 markers
     if box is not None:
         print(f"✅ Crop region detected from {fname}: {box}")
         break
 
+# Phase 2: if not found, check frames 101 ↑ to the end
 if global_crop_box is None:
-    print("⚠️ No ArUco markers detected — proceeding without cropping.")
+    phase2 = [t for t in annot if t[2] >= 101]
+    phase2.sort(key=lambda x: x[2])  # 101, 102, …
+    for _, fname, num in phase2:
+        test_img = cv2.imread(os.path.join(input_folder, fname))
+        if test_img is None:
+            continue
+        box = detect_and_cache_crop_box(test_img)
+        if box is not None:
+            print(f"✅ Crop region detected from {fname}: {box}")
+            break
+
+if global_crop_box is None:
+    print("⚠️ No ArUco markers detected in 100→50 or 101→end — proceeding without cropping.")
 else:
     print(f"📦 Using cached crop region: {global_crop_box}")
 
