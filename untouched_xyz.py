@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 import os
 import cv2
 import ast
 import pandas as pd
 import argparse
 import numpy as np
+from tqdm import tqdm  # progress bars
 
 # ---------- Utility Functions ----------
 
@@ -32,7 +34,11 @@ def load_coms_and_bboxes_from_csv(csv_path, ref_frame):
     coms = {obj: {} for obj in df.columns if obj != "filename"}
     bboxes = {}
 
-    for _, row in df.iterrows():
+    # Progress bar over rows
+    for _, row in tqdm(df.iterrows(),
+                       total=len(df),
+                       desc="Loading COMs & reference bboxes",
+                       unit="row"):
         fname = row["filename"]
         frame_idx = int(''.join(filter(str.isdigit, fname)))
 
@@ -74,8 +80,10 @@ def load_depth_data(depth_csv):
     df = pd.read_csv(depth_csv)
     depth_data = {}
 
-    for _, row in df.iterrows():
-        # Extract digits even if frame label is like 'frame_000000'
+    for _, row in tqdm(df.iterrows(),
+                       total=len(df),
+                       desc="Loading depth COMs",
+                       unit="row"):
         frame_idx = int(''.join(filter(str.isdigit, str(row["frame"]))))
 
         for col in df.columns:
@@ -99,7 +107,11 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
     untouched = {}
     start_frame = int(start_time * fps)
 
-    for obj, com_dict in coms.items():
+    # Outer progress bar over objects
+    for obj, com_dict in tqdm(coms.items(),
+                              total=len(coms),
+                              desc="Analyzing untouched intervals (per object)",
+                              unit="obj"):
         if obj not in bboxes:
             continue
 
@@ -110,9 +122,12 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
         frames = sorted(com_dict.keys())
         untouched[obj] = []
 
+        # Compact inner bar for frame scan of this object (leave=False keeps output clean)
+        pbar = tqdm(total=len(frames), desc=f"  ↳ {obj}", unit="frame", leave=False)
         i = 0
         while i < len(frames):
             frame = frames[i]
+            pbar.update(1)  # count the step we are inspecting
             if frame < start_frame:
                 i += 1
                 continue
@@ -124,6 +139,7 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
             if com_dict[frame] is None:
                 i += 1
                 continue  # skip this frame for starting untouched interval
+
             cx, cy = com_dict[frame]
             bbox_xmin = cx - width / 2
             bbox_xmax = cx + width / 2
@@ -167,9 +183,11 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                 while j < len(frames):
                     fnum = frames[j]
                     fx_fy = com_dict[fnum]
+                    # We will update the bar at the end of loop iteration
                     if fx_fy is None:  # treat missing COM as still inside
                         y_end = fnum
                         j += 1
+                        pbar.update(1)
                         continue
 
                     fx, fy = fx_fy
@@ -187,13 +205,17 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                     if inside_box and depth_ok:
                         y_end = fnum
                         j += 1
+                        pbar.update(1)
                     else:
                         break
 
                 untouched[obj].append([x_start, y_end])
-                i = j + window
+                # Skip ahead with a small stride to avoid redundant checks after a long interval
+                skip = max(window, 1)
+                i = j + skip
             else:
                 i += 1
+        pbar.close()
 
     return untouched
 
@@ -202,14 +224,14 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
     """
     Creates a video with:
     - Cropped frames
-    - Overlayed masks from mask_dir (optional)
+    - Overlayed masks from mask_dir (ROI-sized; if mismatch, fallback-crop using mask_txt_path bounds)
     - Solid/empty circles indicating untouched/moving status
     """
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, video_name)
 
     x_min, y_min, x_max, y_max = crop_box
-    frame_files = sorted([f for f in os.listdir(in_dir) if f.endswith(('.png', '.jpg'))])
+    frame_files = sorted([f for f in os.listdir(in_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
 
     if not frame_files:
         raise RuntimeError("No frames found in input directory")
@@ -219,23 +241,24 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (crop_w, crop_h))
 
-    # Color mapping for circles
-    circle_colors = {
-        "red": (0, 255, 0),       # red → green
-        "green": (0, 0, 255),     # green → red
-        "gray": (0, 255, 255),    # gray → yellow
-        "yellow_1": (255, 0, 0),  # yellow_1 → blue
-        "yellow_2": (0, 128, 255),# yellow_2 → orange
-        "gold": (128, 0, 255)     # gold → violet
+    # ---------- Single source of truth for colors (OpenCV BGR) ----------
+    COLOR_MAP = {
+        "red":      (0, 255, 0),    # red object → green
+        "green":    (0, 0, 255),    # green object → red
+        "gray":     (0, 255, 255),  # gray object → yellow
+        "yellow_1": (255, 0, 0),    # 1st yellow → blue
+        "yellow_2": (0, 128, 255),  # 2nd yellow → orange
+        "gold":     (128, 0, 255),  # golden object → violet
     }
+    objects = list(COLOR_MAP.keys())
 
-    objects = list(circle_colors.keys())
     circle_radius = 6
     start_x = 20
     spacing = 40
     baseline_y = 50  # dots just below frame number
 
-    for fname in frame_files:
+    # Progress bar for rendering frames
+    for fname in tqdm(frame_files, desc="Rendering video frames", unit="frame"):
         frame_idx = int(''.join(filter(str.isdigit, fname)))
         frame_path = os.path.join(in_dir, fname)
         frame = cv2.imread(frame_path)
@@ -246,27 +269,53 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
         cropped = frame[y_min:y_max, x_min:x_max].copy()
         overlay = cropped.copy()
 
-        # --- Overlay masks if mask_dir is provided ---
+        # --- Overlay masks (contours + semi-transparent fill + outline) ---
         if mask_dir:
-            for obj, color in circle_colors.items():
-                mask_obj_dir = os.path.join(mask_dir, obj)
-                mask_file = os.path.join(mask_obj_dir, fname)
-                if os.path.exists(mask_file):
-                    mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
-                    if mask is not None:
-                        colored_mask = np.zeros_like(cropped)
-                        colored_mask[mask > 0] = color
-                        overlay = cv2.addWeighted(overlay, 1.0, colored_mask, 0.5, 0)
+            overlay_img = overlay.copy()
+            for obj in objects:
+                mpath = os.path.join(mask_dir, obj, fname)
+                if not os.path.exists(mpath):
+                    continue
+                mask = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    continue
+
+                # If mask is full-frame by mistake, crop it to the ROI as a fallback
+                if mask.shape[:2] != overlay.shape[:2]:
+                    if mask.shape[0] >= y_max and mask.shape[1] >= x_max:
+                        mask = mask[y_min:y_max, x_min:x_max]
+                    else:
+                        print(f"[warn] Mask size mismatch for {obj} @ {fname}: {mask.shape} != {overlay.shape[:2]}")
+                        continue
+
+                color = COLOR_MAP.get(obj, (255, 255, 255))
+
+                # Contours (largest only; change to draw all if preferred)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    continue
+                c = max(contours, key=cv2.contourArea)
+                contours_to_draw = [c]
+
+                # Semi-transparent fill
+                fill = np.zeros_like(overlay, dtype=np.uint8)
+                cv2.drawContours(fill, contours_to_draw, -1, color, thickness=cv2.FILLED)
+                overlay_img = cv2.addWeighted(overlay_img, 1.0, fill, 0.4, 0)
+
+                # Outline
+                cv2.drawContours(overlay_img, contours_to_draw, -1, color, thickness=2)
+
+            overlay = overlay_img
 
         # --- Draw frame number ---
         cv2.putText(overlay, f"Frame: {frame_idx}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-        # --- Draw untouched/moving circles below frame number ---
+        # --- Draw untouched/moving circles below frame number (same COLOR_MAP) ---
         for i, obj in enumerate(objects):
             cx = start_x + i * spacing
             cy = baseline_y
-            color = circle_colors[obj]
+            color = COLOR_MAP[obj]
 
             is_untouched = any(x <= frame_idx <= y for (x, y) in untouched.get(obj, []))
 
@@ -288,12 +337,12 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
 # ---------- Pipeline ----------
 
 def untouched_pipeline(in_dir, csv_path, mask_txt_path, output_dir, start_time,
-                       ref_frame, window, fps, video_name, depth_csv):
+                       ref_frame, window, fps, video_name, depth_csv, mask_dir=None):
     crop_box = parse_crop_box(mask_txt_path)
     bboxes, coms = load_coms_and_bboxes_from_csv(csv_path, ref_frame)
     depth_data = load_depth_data(depth_csv)
     untouched = analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data)
-    make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=args.mask)
+    make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=mask_dir)
     return untouched
 
 
@@ -325,7 +374,8 @@ if __name__ == "__main__":
         window=args.window,
         fps=args.fps,
         video_name=args.video_name,
-        depth_csv=args.depth_csv
+        depth_csv=args.depth_csv,
+        mask_dir=args.mask
     )
 
     # Save untouched intervals to file
