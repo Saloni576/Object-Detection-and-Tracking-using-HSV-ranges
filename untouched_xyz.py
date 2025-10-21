@@ -99,15 +99,22 @@ def load_depth_data(depth_csv):
 
 def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data):
     """
-    Detects 'untouched' intervals for each object by checking:
-      - If, in the previous `window` frames, the object's COM stayed within its bbox
-        (built dynamically using COM at current frame + width/height from reference),
-      - AND if depth values were within the acceptable range for each frame.
+    Untouched interval logic:
+
+    Start:
+      • At frame x, build bbox (center at COM[x], size from reference width/height).
+      • If previous `window` frames (x-window..x-1) are ALL inside & z-ok, start interval.
+
+    Extend forward:
+      • Keep extending while frames are inside & z-ok.
+      • When first bad frame y appears, look ahead and require `window` CONSECUTIVE bad frames
+        to end the interval.
+      • NEW: In this forward check, frames with missing COM OR missing depth are IGNORED
+        (they don't increment or reset the consecutive-bad count and don't extend the end).
     """
     untouched = {}
     start_frame = int(start_time * fps)
 
-    # Outer progress bar over objects
     for obj, com_dict in tqdm(coms.items(),
                               total=len(coms),
                               desc="Analyzing untouched intervals (per object)",
@@ -122,44 +129,40 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
         frames = sorted(com_dict.keys())
         untouched[obj] = []
 
-        # Compact inner bar for frame scan of this object (leave=False keeps output clean)
         pbar = tqdm(total=len(frames), desc=f"  ↳ {obj}", unit="frame", leave=False)
         i = 0
         while i < len(frames):
             frame = frames[i]
-            pbar.update(1)  # count the step we are inspecting
+            pbar.update(1)
             if frame < start_frame:
                 i += 1
                 continue
 
-            if frame not in com_dict:
+            # Need a valid COM at the candidate start frame
+            if com_dict.get(frame) is None:
                 i += 1
                 continue
 
-            if com_dict[frame] is None:
-                i += 1
-                continue  # skip this frame for starting untouched interval
-
             cx, cy = com_dict[frame]
+            # Dynamic bbox at this frame uses reference width/height centered at current COM
             bbox_xmin = cx - width / 2
             bbox_xmax = cx + width / 2
             bbox_ymin = cy - height / 2
             bbox_ymax = cy + height / 2
 
-            # --- Check previous `window` frames ---
+            # ------------- Lookback check (must be inside & depth-ok for `window` frames) -------------
             lookback_indices = [f for f in frames if frame - window <= f < frame]
-            inside = True
+            inside_ok = True
             for prev_f in lookback_indices:
-                px_py = com_dict[prev_f]
-                if px_py is None:  # missing COM, treat as inside
+                prev_xy = com_dict.get(prev_f)
+                if prev_xy is None:
+                    # (unchanged) treat missing COM as inside during lookback
                     continue
-                px, py = px_py
-                # Check spatial condition
+                px, py = prev_xy
                 if not (bbox_xmin <= px <= bbox_xmax and bbox_ymin <= py <= bbox_ymax):
-                    inside = False
+                    inside_ok = False
                     break
 
-                # Check depth condition
                 if obj in depth_data and prev_f in depth_data[obj]:
                     depth_val = depth_data[obj][prev_f]
                     if obj.startswith("yellow"):
@@ -167,54 +170,59 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                     else:
                         depth_ok = 680 <= depth_val <= 760
                     if not depth_ok:
-                        inside = False
+                        inside_ok = False
                         break
                 else:
-                    inside = False
+                    # (unchanged) missing depth is NOT ok for lookback
+                    inside_ok = False
                     break
 
-            # --- If passed lookback checks ---
-            if inside and len(lookback_indices) >= window:
-                x_start = max(start_frame, lookback_indices[0])
-                y_end = frame
-
-                # --- Extend forward until object leaves bbox or depth range ---
+            if inside_ok and len(lookback_indices) >= window:
+                x_start = max(start_frame, lookback_indices[0]) if lookback_indices else frame
+                y_end = frame  # will extend forward
                 j = i + 1
+
+                # ---------------- Forward extension with "consecutive-out" logic ----------------
+                consec_bad = 0  # counts consecutive frames that are outside or depth-bad
                 while j < len(frames):
                     fnum = frames[j]
-                    fx_fy = com_dict[fnum]
-                    # We will update the bar at the end of loop iteration
-                    if fx_fy is None:  # treat missing COM as still inside
-                        y_end = fnum
+                    pbar.update(1)
+
+                    fxy = com_dict.get(fnum)
+                    # >>> CHANGED: skip frames with missing COM in forward check
+                    if fxy is None:
                         j += 1
-                        pbar.update(1)
-                        continue
+                        continue  # do not change y_end or consec_bad
 
-                    fx, fy = fx_fy
-                    inside_box = bbox_xmin <= fx <= bbox_xmax and bbox_ymin <= fy <= bbox_ymax
+                    fx, fy = fxy
+                    # Depth value must also be present to evaluate this frame
+                    if not (obj in depth_data and fnum in depth_data[obj]):
+                        j += 1
+                        continue  # >>> CHANGED: missing depth is ignored in forward check
 
-                    if obj in depth_data and fnum in depth_data[obj]:
-                        depth_val = depth_data[obj][fnum]
-                        if obj.startswith("yellow"):
-                            depth_ok = 720 <= depth_val <= 760
-                        else:
-                            depth_ok = 680 <= depth_val <= 760
+                    # Now we have both COM and depth → evaluate
+                    inside_box = (bbox_xmin <= fx <= bbox_xmax) and (bbox_ymin <= fy <= bbox_ymax)
+                    depth_val = depth_data[obj][fnum]
+                    if obj.startswith("yellow"):
+                        depth_ok = 720 <= depth_val <= 760
                     else:
-                        depth_ok = False
+                        depth_ok = 680 <= depth_val <= 760
 
                     if inside_box and depth_ok:
                         y_end = fnum
+                        consec_bad = 0
                         j += 1
-                        pbar.update(1)
                     else:
-                        break
+                        consec_bad += 1
+                        j += 1
+                        if consec_bad >= window:
+                            break
 
                 untouched[obj].append([x_start, y_end])
-                # Skip ahead with a small stride to avoid redundant checks after a long interval
-                skip = max(window, 1)
-                i = j + skip
+                i = j
             else:
                 i += 1
+
         pbar.close()
 
     return untouched
