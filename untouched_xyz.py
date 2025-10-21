@@ -5,6 +5,7 @@ import ast
 import pandas as pd
 import argparse
 import numpy as np
+from collections import deque
 from tqdm import tqdm  # progress bars
 
 # ---------- Utility Functions ----------
@@ -34,7 +35,6 @@ def load_coms_and_bboxes_from_csv(csv_path, ref_frame):
     coms = {obj: {} for obj in df.columns if obj != "filename"}
     bboxes = {}
 
-    # Progress bar over rows
     for _, row in tqdm(df.iterrows(),
                        total=len(df),
                        desc="Loading COMs & reference bboxes",
@@ -46,7 +46,6 @@ def load_coms_and_bboxes_from_csv(csv_path, ref_frame):
             val = row[obj]
             if pd.isna(val) or str(val).strip() == "":
                 continue
-
             try:
                 cx, cy, w, h = ast.literal_eval(val)
             except Exception:
@@ -54,6 +53,7 @@ def load_coms_and_bboxes_from_csv(csv_path, ref_frame):
 
             coms[obj][frame_idx] = (cx, cy)
 
+            # capture a reference width/height at ref_frame for this object
             if frame_idx == ref_frame and obj not in bboxes:
                 x_min = cx - w / 2
                 x_max = cx + w / 2
@@ -61,7 +61,7 @@ def load_coms_and_bboxes_from_csv(csv_path, ref_frame):
                 y_max = cy + h / 2
                 bboxes[obj] = (x_min, y_min, x_max, y_max)
 
-    # --- Fill missing frames with None ---
+    # --- Fill missing frames with None so all objects have a contiguous range ---
     all_frames = [int(''.join(filter(str.isdigit, f))) for f in df["filename"]]
     min_frame, max_frame = min(all_frames), max(all_frames)
     for obj in coms.keys():
@@ -97,150 +97,186 @@ def load_depth_data(depth_csv):
     return depth_data
 
 
-def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data):
+# ---------- New: Frame-major streaming analysis ----------
+
+def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, depth_data):
     """
-    Untouched interval logic:
+    Streaming/Realtime version (frame-major pass):
 
-    Start:
-      • At frame x, build bbox (center at COM[x], size from reference width/height).
-      • If previous `window` frames (x-window..x-1) are ALL inside & z-ok, start interval.
-
-    Extend forward:
-      • Keep extending while frames are inside & z-ok.
-      • When first bad frame y appears, we enter a CHECKING window.
-      • We only end untouched when there are `window` CONSECUTIVE bad frames
-        (outside or z-bad) among frames that have BOTH COM and depth.
-      • Frames with missing COM OR missing depth are IGNORED in forward check
-        (do not extend, do not increment/reset the consecutive-bad counter).
-
-    Returns:
-      untouched: {obj: [[s,e], ...]}  (confirmed untouched spans; single span like [x-p, z-1])
-      checking:  {obj: [[s,e], ...]}  (frames while p-bad decision is pending)
+    • For each frame (ascending), evaluate every object and update a small per-object state machine.
+    • Start an untouched interval at frame f IF the previous `window` frames (f-window..f-1) are
+      all inside a bbox (center = COM at f, size = reference W×H) AND depth-ok.
+        - Missing COM in lookback is treated as "inside" but still requires depth to be present;
+          if depth missing, lookback fails (same as your original).
+    • While an interval is active, keep a FIXED bbox (f's center, ref W×H).
+      - Good evaluable frame (COM+depth, inside & depth-ok) extends the interval and closes any open checking span.
+      - Bad evaluable frame (COM+depth, outside OR depth-bad) increases a consecutive-bad counter.
+        When it reaches `window`, the interval ends at the last good frame, and the checking span closes at the
+        decision frame.
+      - Frames with missing COM or missing depth are ignored (do not extend, do not increment/reset counters).
+    • Returns two dicts: untouched spans and checking spans per object.
     """
-    untouched = {}
-    checking = {}
+    # Build global frame range
+    any_obj = next(iter(coms))
+    frames_sorted = sorted(coms[any_obj].keys())
+    min_frame, max_frame = frames_sorted[0], frames_sorted[-1]
     start_frame = int(start_time * fps)
 
-    for obj, com_dict in tqdm(coms.items(),
-                              total=len(coms),
-                              desc="Analyzing untouched intervals (per object)",
-                              unit="obj"):
+    # State per object
+    state = {}
+    untouched = {obj: [] for obj in coms.keys()}
+    checking = {obj: [] for obj in coms.keys()}
+
+    for obj, com_dict in coms.items():
         if obj not in bboxes:
             continue
-
         x_min, y_min, x_max, y_max = bboxes[obj]
-        width = x_max - x_min
-        height = y_max - y_min
+        ref_w = x_max - x_min
+        ref_h = y_max - y_min
 
-        frames = sorted(com_dict.keys())
-        untouched[obj] = []
-        checking[obj] = []
+        state[obj] = dict(
+            interval_active=False,
+            bbox=None,                 # (xmin, ymin, xmax, ymax) for the ACTIVE interval
+            x_start=None,
+            last_good=None,
+            check_start=None,
+            consec_bad=0
+        )
 
-        pbar = tqdm(total=len(frames), desc=f"  ↳ {obj}", unit="frame", leave=False)
-        i = 0
-        while i < len(frames):
-            frame = frames[i]
-            pbar.update(1)
-            if frame < start_frame:
-                i += 1
+    def depth_ok_for(obj_name, z):
+        if obj_name.startswith("yellow"):
+            return 720 <= z <= 760
+        else:
+            return 680 <= z <= 760
+
+    # ---- Main frame-major loop ----
+    pbar = tqdm(range(min_frame, max_frame + 1), desc="Analyzing (frame-major)", unit="frame")
+    for f in pbar:
+        for obj, com_dict in coms.items():
+            # If we don't have a reference bbox (no size), we can't evaluate this object at all.
+            if obj not in bboxes:
                 continue
 
-            # Need a valid COM at the candidate start frame
-            if com_dict.get(frame) is None:
-                i += 1
-                continue
+            st = state[obj]
+            # ---------- CASE A: interval active → extend/close ----------
+            if st["interval_active"]:
+                # Only evaluate if COM and depth exist at f (evaluable frame)
+                xy = com_dict.get(f, None)
+                z_available = (obj in depth_data and f in depth_data[obj])
 
-            cx, cy = com_dict[frame]
-            # Dynamic bbox at this frame uses reference width/height centered at current COM
-            bbox_xmin = cx - width / 2
-            bbox_xmax = cx + width / 2
-            bbox_ymin = cy - height / 2
-            bbox_ymax = cy + height / 2
-
-            # ------------- Lookback check (must be inside & depth-ok for `window` frames) -------------
-            lookback_indices = [f for f in frames if frame - window <= f < frame]
-            inside_ok = True
-            for prev_f in lookback_indices:
-                prev_xy = com_dict.get(prev_f)
-                if prev_xy is None:
-                    # treat missing COM as inside during lookback (as before)
+                if xy is None or not z_available:
+                    # ignore this frame in the forward check
                     continue
-                px, py = prev_xy
-                if not (bbox_xmin <= px <= bbox_xmax and bbox_ymin <= py <= bbox_ymax):
+
+                fx, fy = xy
+                z = depth_data[obj][f]
+                xmin, ymin, xmax, ymax = st["bbox"]
+                inside = (xmin <= fx <= xmax) and (ymin <= fy <= ymax)
+                z_ok = depth_ok_for(obj, z)
+
+                if inside and z_ok:
+                    # good frame: extend last_good, close any checking span
+                    st["last_good"] = f
+                    if st["check_start"] is not None:
+                        checking[obj].append([st["check_start"], f - 1])
+                        st["check_start"] = None
+                    st["consec_bad"] = 0
+                else:
+                    # bad evaluable frame: start/extend checking
+                    if st["check_start"] is None:
+                        st["check_start"] = f
+                    st["consec_bad"] += 1
+                    if st["consec_bad"] >= window:
+                        # Decision: touched → finalize
+                        # If we never saw a good frame after start, guard last_good
+                        end_frame = st["last_good"] if st["last_good"] is not None else (st["x_start"] - 1)
+                        if end_frame >= st["x_start"]:
+                            untouched[obj].append([st["x_start"], end_frame])
+                        # checking includes this decision frame
+                        checking[obj].append([st["check_start"], f])
+                        # reset state
+                        st["interval_active"] = False
+                        st["bbox"] = None
+                        st["x_start"] = None
+                        st["last_good"] = None
+                        st["check_start"] = None
+                        st["consec_bad"] = 0
+
+                continue  # done with active interval
+
+            # ---------- CASE B: interval NOT active → test for START (only when f >= start_frame) ----------
+            if f < start_frame:
+                continue
+
+            xy_f = com_dict.get(f, None)
+            if xy_f is None:
+                # cannot seed a bbox without a COM at f
+                continue
+
+            cx, cy = xy_f
+            # Candidate FIXED bbox (if we start now), centered at COM[f] with reference W×H
+            cand_xmin = cx - ref_w / 2.0
+            cand_xmax = cx + ref_w / 2.0
+            cand_ymin = cy - ref_h / 2.0
+            cand_ymax = cy + ref_h / 2.0
+
+            # Lookback: previous `window` frames must be evaluable & OK
+            lookback_frames = list(range(f - window, f))
+            inside_ok = True
+            observed = 0
+            for pf in lookback_frames:
+                # We treat the lookback strictly by the original rules:
+                # - Missing COM is "inside" by position, BUT we still require depth; if depth missing → fail.
+                # - If COM present, it must lie inside cand bbox.
+                # - Depth must be present and within the allowed range.
+                # If pf < min_frame, fail (we can't satisfy a full lookback before the timeline).
+                if pf < min_frame:
                     inside_ok = False
                     break
 
-                if obj in depth_data and prev_f in depth_data[obj]:
-                    depth_val = depth_data[obj][prev_f]
-                    if obj.startswith("yellow"):
-                        depth_ok = 720 <= depth_val <= 760
-                    else:
-                        depth_ok = 680 <= depth_val <= 760
-                    if not depth_ok:
+                depth_avail = (obj in depth_data and pf in depth_data[obj])
+                if not depth_avail:
+                    inside_ok = False
+                    break
+                z_pf = depth_data[obj][pf]
+                z_ok = depth_ok_for(obj, z_pf)
+                if not z_ok:
+                    inside_ok = False
+                    break
+
+                xy_pf = com_dict.get(pf, None)
+                if xy_pf is not None:
+                    px, py = xy_pf
+                    if not (cand_xmin <= px <= cand_xmax and cand_ymin <= py <= cand_ymax):
                         inside_ok = False
                         break
-                else:
-                    # missing depth is NOT ok for lookback
-                    inside_ok = False
-                    break
 
-            if inside_ok and len(lookback_indices) >= window:
-                x_start = max(start_frame, lookback_indices[0]) if lookback_indices else frame
-                y_end = frame  # will extend forward
-                j = i + 1
+                observed += 1  # count frames we checked
 
-                # ---------------- Forward extension with "consecutive-out" logic ----------------
-                consec_bad = 0  # counts consecutive frames that are outside or depth-bad (with COM+depth available)
-                check_start = None  # start frame of the current checking window (when we first see a "bad" evaluable frame)
+            if inside_ok and observed == window:
+                # Start interval. x_start matches your previous behavior:
+                # max(start_frame, first lookback frame) if exist, else f.
+                x_start = max(start_frame, lookback_frames[0]) if lookback_frames else f
+                state[obj].update(
+                    interval_active=True,
+                    bbox=(cand_xmin, cand_ymin, cand_xmax, cand_ymax),
+                    x_start=x_start,
+                    last_good=f,          # current frame itself is good by definition (starts extension)
+                    check_start=None,
+                    consec_bad=0
+                )
+                # Note: we don't append anything now; we’ll finalize when it ends.
 
-                while j < len(frames):
-                    fnum = frames[j]
-                    pbar.update(1)
-
-                    fxy = com_dict.get(fnum)
-                    if fxy is None:
-                        # ignore this frame in forward check
-                        j += 1
-                        continue
-
-                    if not (obj in depth_data and fnum in depth_data[obj]):
-                        # ignore if missing depth
-                        j += 1
-                        continue
-
-                    fx, fy = fxy
-                    inside_box = (bbox_xmin <= fx <= bbox_xmax) and (bbox_ymin <= fy <= bbox_ymax)
-                    depth_val = depth_data[obj][fnum]
-                    if obj.startswith("yellow"):
-                        depth_ok = 720 <= depth_val <= 760
-                    else:
-                        depth_ok = 680 <= depth_val <= 760
-
-                    if inside_box and depth_ok:
-                        # Good frame: extend untouched and close any checking window
-                        y_end = fnum
-                        if check_start is not None:
-                            checking[obj].append([check_start, fnum - 1])
-                            check_start = None
-                        consec_bad = 0
-                        j += 1
-                    else:
-                        # Bad (evaluable) frame: start/extend checking
-                        if check_start is None:
-                            check_start = fnum
-                        consec_bad += 1
-                        j += 1
-                        if consec_bad >= window:
-                            # Decision: touched → checking includes this last bad frame
-                            checking[obj].append([check_start, fnum])
-                            break
-
-                untouched[obj].append([x_start, y_end])  # confirmed untouched is a single span [x-p, z-1]
-                i = j
-            else:
-                i += 1
-
-        pbar.close()
+    # ---- Finalize: if any interval remains open at the end, close it safely ----
+    for obj, st in state.items():
+        if st["interval_active"]:
+            # If a checking window is open but never reached p-bad, we close it at max_frame- if it existed
+            if st["check_start"] is not None and st["last_good"] is not None and st["check_start"] <= st["last_good"]:
+                checking[obj].append([st["check_start"], st["last_good"]])
+            # Commit the untouched span up to last_good (if any)
+            end_frame = st["last_good"] if st["last_good"] is not None else (st["x_start"] - 1)
+            if end_frame >= st["x_start"]:
+                untouched[obj].append([st["x_start"], end_frame])
 
     return untouched, checking
 
@@ -292,7 +328,6 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
     spacing = 40
     baseline_y = 50  # dots just below frame number
 
-    # Progress bar for rendering frames
     for fname in tqdm(frame_files, desc="Rendering video frames", unit="frame"):
         frame_idx = int(''.join(filter(str.isdigit, fname)))
         frame_path = os.path.join(in_dir, fname)
@@ -301,6 +336,7 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
             continue
 
         # Crop frame
+        x_min, y_min, x_max, y_max = crop_box
         cropped = frame[y_min:y_max, x_min:x_max].copy()
         overlay = cropped.copy()
 
@@ -382,7 +418,8 @@ def untouched_pipeline(in_dir, csv_path, mask_txt_path, output_dir, start_time,
     crop_box = parse_crop_box(mask_txt_path)
     bboxes, coms = load_coms_and_bboxes_from_csv(csv_path, ref_frame)
     depth_data = load_depth_data(depth_csv)
-    untouched, checking = analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data)
+    # NEW: frame-major analysis
+    untouched, checking = analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, depth_data)
     make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=mask_dir, checking=checking)
     return untouched, checking
 
@@ -432,5 +469,4 @@ if __name__ == "__main__":
             ranges = [f"[{start}, {end}]" for start, end in intervals]
             f.write(f"{obj}: {', '.join(ranges)}\n")
 
-    # print_untouched_intervals(untouched_map)
     print(f"\n📝 Untouched intervals saved to: {output_txt_path}")
