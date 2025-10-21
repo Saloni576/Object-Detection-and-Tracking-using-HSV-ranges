@@ -107,12 +107,18 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
 
     Extend forward:
       • Keep extending while frames are inside & z-ok.
-      • When first bad frame y appears, look ahead and require `window` CONSECUTIVE bad frames
-        to end the interval.
-      • NEW: In this forward check, frames with missing COM OR missing depth are IGNORED
-        (they don't increment or reset the consecutive-bad count and don't extend the end).
+      • When first bad frame y appears, we enter a CHECKING window.
+      • We only end untouched when there are `window` CONSECUTIVE bad frames
+        (outside or z-bad) among frames that have BOTH COM and depth.
+      • Frames with missing COM OR missing depth are IGNORED in forward check
+        (do not extend, do not increment/reset the consecutive-bad counter).
+
+    Returns:
+      untouched: {obj: [[s,e], ...]}  (confirmed untouched spans; single span like [x-p, z-1])
+      checking:  {obj: [[s,e], ...]}  (frames while p-bad decision is pending)
     """
     untouched = {}
+    checking = {}
     start_frame = int(start_time * fps)
 
     for obj, com_dict in tqdm(coms.items(),
@@ -128,6 +134,7 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
 
         frames = sorted(com_dict.keys())
         untouched[obj] = []
+        checking[obj] = []
 
         pbar = tqdm(total=len(frames), desc=f"  ↳ {obj}", unit="frame", leave=False)
         i = 0
@@ -156,7 +163,7 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
             for prev_f in lookback_indices:
                 prev_xy = com_dict.get(prev_f)
                 if prev_xy is None:
-                    # (unchanged) treat missing COM as inside during lookback
+                    # treat missing COM as inside during lookback (as before)
                     continue
                 px, py = prev_xy
                 if not (bbox_xmin <= px <= bbox_xmax and bbox_ymin <= py <= bbox_ymax):
@@ -173,7 +180,7 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                         inside_ok = False
                         break
                 else:
-                    # (unchanged) missing depth is NOT ok for lookback
+                    # missing depth is NOT ok for lookback
                     inside_ok = False
                     break
 
@@ -183,24 +190,25 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                 j = i + 1
 
                 # ---------------- Forward extension with "consecutive-out" logic ----------------
-                consec_bad = 0  # counts consecutive frames that are outside or depth-bad
+                consec_bad = 0  # counts consecutive frames that are outside or depth-bad (with COM+depth available)
+                check_start = None  # start frame of the current checking window (when we first see a "bad" evaluable frame)
+
                 while j < len(frames):
                     fnum = frames[j]
                     pbar.update(1)
 
                     fxy = com_dict.get(fnum)
-                    # >>> CHANGED: skip frames with missing COM in forward check
                     if fxy is None:
+                        # ignore this frame in forward check
                         j += 1
-                        continue  # do not change y_end or consec_bad
+                        continue
+
+                    if not (obj in depth_data and fnum in depth_data[obj]):
+                        # ignore if missing depth
+                        j += 1
+                        continue
 
                     fx, fy = fxy
-                    # Depth value must also be present to evaluate this frame
-                    if not (obj in depth_data and fnum in depth_data[obj]):
-                        j += 1
-                        continue  # >>> CHANGED: missing depth is ignored in forward check
-
-                    # Now we have both COM and depth → evaluate
                     inside_box = (bbox_xmin <= fx <= bbox_xmax) and (bbox_ymin <= fy <= bbox_ymax)
                     depth_val = depth_data[obj][fnum]
                     if obj.startswith("yellow"):
@@ -209,31 +217,50 @@ def analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, dep
                         depth_ok = 680 <= depth_val <= 760
 
                     if inside_box and depth_ok:
+                        # Good frame: extend untouched and close any checking window
                         y_end = fnum
+                        if check_start is not None:
+                            checking[obj].append([check_start, fnum - 1])
+                            check_start = None
                         consec_bad = 0
                         j += 1
                     else:
+                        # Bad (evaluable) frame: start/extend checking
+                        if check_start is None:
+                            check_start = fnum
                         consec_bad += 1
                         j += 1
                         if consec_bad >= window:
+                            # Decision: touched → checking includes this last bad frame
+                            checking[obj].append([check_start, fnum])
                             break
 
-                untouched[obj].append([x_start, y_end])
+                untouched[obj].append([x_start, y_end])  # confirmed untouched is a single span [x-p, z-1]
                 i = j
             else:
                 i += 1
 
         pbar.close()
 
-    return untouched
+    return untouched, checking
 
 
-def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=None):
+# --- Helper for semi-transparent drawing ---
+def _draw_transparent_circle(img_bgr, center, radius, color_bgr, alpha=0.45, outline=True):
+    """Blend a filled circle with transparency onto img_bgr."""
+    overlay = img_bgr.copy()
+    cv2.circle(overlay, center, radius, color_bgr, thickness=-1)
+    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, dst=img_bgr)
+    if outline:
+        cv2.circle(img_bgr, center, radius, color_bgr, 1)
+
+
+def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=None, checking=None):
     """
     Creates a video with:
     - Cropped frames
     - Overlayed masks from mask_dir (ROI-sized; if mismatch, fallback-crop using mask_txt_path bounds)
-    - Solid/empty circles indicating untouched/moving status
+    - Solid (untouched) / semi-transparent (checking) / empty (moving) circles
     """
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, video_name)
@@ -298,7 +325,7 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
 
                 color = COLOR_MAP.get(obj, (255, 255, 255))
 
-                # Contours (largest only; change to draw all if preferred)
+                # Contours (largest only)
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 if not contours:
                     continue
@@ -319,15 +346,21 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
         cv2.putText(overlay, f"Frame: {frame_idx}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-        # --- Draw untouched/moving circles below frame number (same COLOR_MAP) ---
+        # --- Draw per-object state circles ---
         for i, obj in enumerate(objects):
             cx = start_x + i * spacing
             cy = baseline_y
             color = COLOR_MAP[obj]
 
-            is_untouched = any(x <= frame_idx <= y for (x, y) in untouched.get(obj, []))
+            obj_untouched = untouched.get(obj, [])
+            obj_checking  = (checking or {}).get(obj, [])
 
-            if is_untouched:
+            is_untouched = any(x <= frame_idx <= y for (x, y) in obj_untouched)
+            is_checking  = any(x <= frame_idx <= y for (x, y) in obj_checking)
+
+            if is_checking:
+                _draw_transparent_circle(overlay, (cx, cy), circle_radius, color, alpha=0.45, outline=True)
+            elif is_untouched:
                 cv2.circle(overlay, (cx, cy), circle_radius, color, -1)  # solid = untouched
             else:
                 cv2.circle(overlay, (cx, cy), circle_radius, color, 2)   # empty = moving
@@ -349,9 +382,9 @@ def untouched_pipeline(in_dir, csv_path, mask_txt_path, output_dir, start_time,
     crop_box = parse_crop_box(mask_txt_path)
     bboxes, coms = load_coms_and_bboxes_from_csv(csv_path, ref_frame)
     depth_data = load_depth_data(depth_csv)
-    untouched = analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data)
-    make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=mask_dir)
-    return untouched
+    untouched, checking = analyze_untouched_objects_dynamic(coms, bboxes, start_time, fps, window, depth_data)
+    make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=mask_dir, checking=checking)
+    return untouched, checking
 
 
 # ---------- CLI Entry Point ----------
@@ -372,7 +405,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    untouched_list = untouched_pipeline(
+    untouched_map, checking_map = untouched_pipeline(
         in_dir=args.in_dir,
         csv_path=args.csv_path,
         mask_txt_path=args.mask_txt_path,
@@ -386,18 +419,18 @@ if __name__ == "__main__":
         mask_dir=args.mask
     )
 
-    # Save untouched intervals to file
+    # Save untouched intervals to file (only confirmed untouched, no checking)
     output_txt_path = os.path.join(args.output_dir, "untouched_intervals_xyz.txt")
     os.makedirs(args.output_dir, exist_ok=True)
 
     with open(output_txt_path, "w", encoding="utf-8") as f:
-        f.write("📌 Untouched intervals per object:\n")
-        for obj, intervals in untouched_list.items():
+        f.write("📌 Untouched intervals (confirmed):\n")
+        for obj, intervals in untouched_map.items():
             if not intervals:
                 f.write(f"{obj}: None\n")
                 continue
             ranges = [f"[{start}, {end}]" for start, end in intervals]
             f.write(f"{obj}: {', '.join(ranges)}\n")
 
-    # print_untouched_intervals(untouched_list)
+    # print_untouched_intervals(untouched_map)
     print(f"\n📝 Untouched intervals saved to: {output_txt_path}")
