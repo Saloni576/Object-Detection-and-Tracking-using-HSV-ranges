@@ -8,6 +8,7 @@ import csv
 from scipy.spatial import distance as dist
 import math
 import cv2.aruco as aruco
+from tqdm import tqdm  # NEW
 
 # ----------------- Argument Parser -----------------
 parser = argparse.ArgumentParser(description="Detect objects and save masks")
@@ -32,6 +33,11 @@ parser.add_argument(
     "--csv",
     help="Path to output CSV file with bounding box areas"
 )
+parser.add_argument(
+    "--no_progress",
+    action="store_true",
+    help="Disable tqdm progress bars"
+)
 args = parser.parse_args()
 
 input_folder = args.in_dir.rstrip("/\\")
@@ -40,6 +46,13 @@ mask_dir = args.mask_dir.rstrip("/\\")
 
 os.makedirs(mask_obj_dir, exist_ok=True)
 os.makedirs(mask_dir, exist_ok=True)
+
+# Small helper so tqdm + prints don't fight
+def log_msg(msg: str):
+    if args.no_progress:
+        print(msg)
+    else:
+        tqdm.write(msg)
 
 # ===== Helpers for frame sorting =====
 INT_RE = re.compile(r"(\d+)")
@@ -102,7 +115,7 @@ def detect_and_cache_crop_box(img: np.ndarray):
     x_min, y_min = np.min(pts, axis=0)
     x_max, y_max = np.max(pts, axis=0)
     global_crop_box = (x_min, y_min, x_max, y_max)
-    print(f"✅ Cached ArUco crop box: {global_crop_box}")
+    log_msg(f"✅ Cached ArUco crop box: {global_crop_box}")
     return global_crop_box
 
 
@@ -140,7 +153,7 @@ def union_significant_contours(binary_mask: np.ndarray, min_area: int = 65, area
 
 # ======== Detect crop region from ArUco markers (100→50, else 101→end) ========
 global_crop_box = None
-print("🔍 Searching for ArUco markers to define crop region...")
+log_msg("🔍 Searching for ArUco markers to define crop region...")
 
 def _parse_frame_num(fname: str):
     m = re.search(r"frame_(\d+)\.png$", fname, re.IGNORECASE)
@@ -154,32 +167,34 @@ annot = [t for t in annot if t[2] is not None]
 phase1 = [t for t in annot if 50 <= t[2] <= 100]
 phase1.sort(key=lambda x: x[2], reverse=True)  # 100, 99, …, 50
 
-for _, fname, num in phase1:
+iter_phase1 = phase1 if args.no_progress else tqdm(phase1, desc="Phase 1: ArUco scan (100→50)", unit="frame")
+for _, fname, num in iter_phase1:
     test_img = cv2.imread(os.path.join(input_folder, fname))
     if test_img is None:
         continue
     box = detect_and_cache_crop_box(test_img)  # still requires exactly 3 or 4 markers
     if box is not None:
-        print(f"✅ Crop region detected from {fname}: {box}")
+        log_msg(f"✅ Crop region detected from {fname}: {box}")
         break
 
 # Phase 2: if not found, check frames 101 ↑ to the end
 if global_crop_box is None:
     phase2 = [t for t in annot if t[2] >= 101]
     phase2.sort(key=lambda x: x[2])  # 101, 102, …
-    for _, fname, num in phase2:
+    iter_phase2 = phase2 if args.no_progress else tqdm(phase2, desc="Phase 2: ArUco scan (101→end)", unit="frame")
+    for _, fname, num in iter_phase2:
         test_img = cv2.imread(os.path.join(input_folder, fname))
         if test_img is None:
             continue
         box = detect_and_cache_crop_box(test_img)
         if box is not None:
-            print(f"✅ Crop region detected from {fname}: {box}")
+            log_msg(f"✅ Crop region detected from {fname}: {box}")
             break
 
 if global_crop_box is None:
-    print("⚠️ No ArUco markers detected in 100→50 or 101→end — proceeding without cropping.")
+    log_msg("⚠️ No ArUco markers detected in 100→50 or 101→end — proceeding without cropping.")
 else:
-    print(f"📦 Using cached crop region: {global_crop_box}")
+    log_msg(f"📦 Using cached crop region: {global_crop_box}")
 
 # --- Save crop box details to mask.txt ---
 mask_txt_path = os.path.join(mask_dir, "mask.txt")
@@ -193,14 +208,15 @@ with open(mask_txt_path, "w") as f:
         f.write(f"y_min={y_min}\n")
         f.write(f"x_max={x_max}\n")
         f.write(f"y_max={y_max}\n")
-print(f"📝 Crop region info saved to {mask_txt_path}")
+log_msg(f"📝 Crop region info saved to {mask_txt_path}")
 
 # ======== Now begin normal processing loop ========
-for fname in all_pngs:
+iter_frames = all_pngs if args.no_progress else tqdm(all_pngs, desc="Processing frames", unit="file")
+for fname in iter_frames:
     image_path = os.path.join(input_folder, fname)
     image = cv2.imread(image_path)
     if image is None:
-        print(f"Skipping {fname}, could not load.")
+        log_msg(f"Skipping {fname}, could not load.")
         continue
 
     # Apply cached crop region if available
@@ -238,7 +254,6 @@ for fname in all_pngs:
 
     # --- Gray (largest object) ---
     if "gray" in args.colors:
-        # mask_gray = cv2.inRange(hsv, np.array([10, 0, 90]), np.array([100, 80, 160]))
         mask_gray = cv2.inRange(hsv, np.array([10, 0, 90]), np.array([100, 50, 160]))
         mask_gray = cv2.morphologyEx(mask_gray, cv2.MORPH_OPEN, kernel)
         mask_gray = cv2.morphologyEx(mask_gray, cv2.MORPH_CLOSE, kernel)
@@ -339,7 +354,6 @@ for fname in all_pngs:
     # --- Gold (largest object) ---
     if "gold" in args.colors:
         mask_gold = cv2.inRange(hsv, np.array([18, 100, 120]), np.array([23, 190, 190]))
-        # mask_gold = cv2.inRange(hsv, np.array([15, 120, 140]), np.array([25, 190, 190]))
         mask_gold = cv2.morphologyEx(mask_gold, cv2.MORPH_OPEN, kernel)
         mask_gold = cv2.morphologyEx(mask_gold, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(mask_gold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -431,7 +445,7 @@ for fname in all_pngs:
     if args.num is not None and num_detections == args.num:
         frames_with_num[args.num].append(fname)
 
-    print(f"Processed {fname} | Detections: {num_detections}")
+    # log_msg(f"Processed {fname} | Detections: {num_detections}")
 
 # --- Write summary log safely ---
 if args.log:
@@ -450,40 +464,78 @@ if args.log:
             for frame in frames_with_num[args.num]:
                 f.write(frame + "\n")
 
-    print(f"\n✅ Log written to {args.log}")
+    log_msg(f"\n✅ Log written to {args.log}")
 else:
-    print("\n⚠️ No --log path provided, skipping log file.")
+    log_msg("\n⚠️ No --log path provided, skipping log file.")
 
 # --- Save CSV in (filename, red, green, gray, yellow_1, yellow_2, gold) format ---
 if args.csv:
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.csv), exist_ok=True)
+    # Ensure output directory exists (if a folder is present in the path)
+    csv_dir = os.path.dirname(args.csv)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
 
-    # Define desired order of color columns
+    # Desired order of columns
     color_columns = ["red", "green", "gray", "yellow_1", "yellow_2", "gold"]
 
-    # Group results by filename
+    # Group results by filename and store compact bbox with COM
     grouped = {}
     for row in csv_rows:
         fname = row["filename"]
         color = row["color"]
         if fname not in grouped:
             grouped[fname] = {}
-        # Compute center
         cx = row["x"] + row["width"] // 2
         cy = row["y"] + row["height"] // 2
         grouped[fname][color] = f"({cx},{cy},{row['width']},{row['height']})"
 
-    # Write new CSV
+    # Helper to parse "(cx,cy,w,h)" → (cx, cy)
+    _COM_RE = re.compile(r"\(([-\d]+),([-\d]+),([-\d]+),([-\d]+)\)$")
+
     with open(args.csv, "w", newline="") as csvfile:
         fieldnames = ["filename"] + color_columns
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        for fname in sorted(grouped.keys()):
+        prev_gray_com = None          # last ACCEPTED gray COM (cx, cy)
+        prev_gray_frame_num = None    # frame number where gray was last ACCEPTED
+
+        # Sort by numeric frame index (uses your existing helper)
+        for fname in sorted(grouped.keys(), key=_parse_frame_num):
             row_data = {"filename": fname}
+            frame_num = _parse_frame_num(fname)
+
+            # Start by copying detections (or empty strings)
             for col in color_columns:
                 row_data[col] = grouped[fname].get(col, "")
+
+            # ---- Gray COM jump suppression (>79.4 px) after frame 100, regardless of gaps ----
+            gray_val = grouped[fname].get("gray", "")
+            if gray_val:
+                m = _COM_RE.match(gray_val)
+                if m:
+                    cx, cy = int(m.group(1)), int(m.group(2))
+
+                    if frame_num is not None and frame_num > 100 and prev_gray_com is not None:
+                        jump = math.hypot(cx - prev_gray_com[0], cy - prev_gray_com[1])
+                        if jump > 79.4:
+                            # Suppress gray for this frame; keep previous baseline
+                            row_data["gray"] = ""
+                        else:
+                            # Accept and update baseline
+                            row_data["gray"] = gray_val
+                            prev_gray_com = (cx, cy)
+                            prev_gray_frame_num = frame_num
+                    else:
+                        # No prior accepted gray or <=100 → accept and set baseline
+                        row_data["gray"] = gray_val
+                        prev_gray_com = (cx, cy)
+                        prev_gray_frame_num = frame_num
+                # else: if parsing fails, keep whatever is there (or blank)
+
+            # If gray is absent this frame, we do not change the baseline;
+            # next accepted gray will still be compared to the last accepted one.
+
             writer.writerow(row_data)
 
-    print(f"✅ CSV written to {args.csv} with compact bounding box format.")
+    print(f"✅ CSV written to {args.csv} with gray COM jump filtering (>79.4 px after frame 100, gap-tolerant).")
