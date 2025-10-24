@@ -187,12 +187,37 @@ def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, d
                         st["check_start"] = f
                     st["consec_bad"] += 1
                     if st["consec_bad"] >= window:
-                        # Decision: touched → finalize
-                        # If we never saw a good frame after start, guard last_good
+                        # Before finalizing, do a lookahead check
+                        lookahead_frames = range(f + 1, f + window)
+                        detected_inside_found = False
+
+                        for fa in lookahead_frames:
+                            if fa > max_frame:
+                                break
+                            xy_fa = com_dict.get(fa, None)
+                            if xy_fa is None:
+                                continue  # only consider frames where COM exists
+
+                            fx_a, fy_a = xy_fa
+                            if obj in depth_data and fa in depth_data[obj]:
+                                z_a = depth_data[obj][fa]
+                                if depth_ok_for(obj, z_a):
+                                    xmin, ymin, xmax, ymax = st["bbox"]
+                                    inside = (xmin <= fx_a <= xmax) and (ymin <= fy_a <= ymax)
+                                    if inside:
+                                        detected_inside_found = True
+                                        break
+
+                        if detected_inside_found:
+                            # treat as outlier — do NOT end interval
+                            st["consec_bad"] = 0
+                            st["check_start"] = None
+                            continue  # keep interval active
+
+                        # else, all detected COMs were outside bbox → end interval normally
                         end_frame = st["last_good"] if st["last_good"] is not None else (st["x_start"] - 1)
                         if end_frame >= st["x_start"]:
                             untouched[obj].append([st["x_start"], end_frame])
-                        # checking includes this decision frame
                         checking[obj].append([st["check_start"], f])
                         # reset state
                         st["interval_active"] = False
