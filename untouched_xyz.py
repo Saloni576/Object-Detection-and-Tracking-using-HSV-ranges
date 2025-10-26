@@ -99,7 +99,7 @@ def load_depth_data(depth_csv):
 
 # ---------- New: Frame-major streaming analysis ----------
 
-def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, depth_data):
+def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, p, q, depth_data):
     """
     Streaming/Realtime version (frame-major pass):
 
@@ -186,9 +186,9 @@ def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, d
                     if st["check_start"] is None:
                         st["check_start"] = f
                     st["consec_bad"] += 1
-                    if st["consec_bad"] >= window:
+                    if st["consec_bad"] >= q:
                         # Before finalizing, do a lookahead check
-                        lookahead_frames = range(f + 1, f + window)
+                        lookahead_frames = range(f + 1, f + q)
                         detected_inside_found = False
 
                         for fa in lookahead_frames:
@@ -246,7 +246,7 @@ def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, d
             cand_ymax = cy + ref_h / 2.0
 
             # Lookback: previous `window` frames must be evaluable & OK
-            lookback_frames = list(range(f - window, f))
+            lookback_frames = list(range(f - p, f))
             inside_ok = True
             observed = 0
             for pf in lookback_frames:
@@ -278,7 +278,7 @@ def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, d
 
                 observed += 1  # count frames we checked
 
-            if inside_ok and observed == window:
+            if inside_ok and observed == p:
                 # Start interval. x_start matches your previous behavior:
                 # max(start_frame, first lookback frame) if exist, else f.
                 x_start = max(start_frame, lookback_frames[0]) if lookback_frames else f
@@ -439,12 +439,12 @@ def make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fp
 # ---------- Pipeline ----------
 
 def untouched_pipeline(in_dir, csv_path, mask_txt_path, output_dir, start_time,
-                       ref_frame, window, fps, video_name, depth_csv, mask_dir=None):
+                       ref_frame, p, q, fps, video_name, depth_csv, mask_dir=None):
     crop_box = parse_crop_box(mask_txt_path)
     bboxes, coms = load_coms_and_bboxes_from_csv(csv_path, ref_frame)
     depth_data = load_depth_data(depth_csv)
     # NEW: frame-major analysis
-    untouched, checking = analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, window, depth_data)
+    untouched, checking = analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, p, q, depth_data)
     make_untouched_video(in_dir, crop_box, untouched, output_dir, video_name, fps, coms, mask_dir=mask_dir, checking=checking)
     return untouched, checking
 
@@ -461,7 +461,10 @@ if __name__ == "__main__":
     parser.add_argument("--mask", help="Directory containing binary object masks (optional)")
     parser.add_argument("--start_time", type=float, required=True, help="Start time in seconds")
     parser.add_argument("--ref_frame", type=int, default=100, help="Reference frame index")
-    parser.add_argument("--window", type=int, default=10, help="Number of frames to check for untouched")
+    parser.add_argument("--p", type=int, default=10,
+                    help="Number of previous frames to check for starting an untouched interval")
+    parser.add_argument("--q", type=int, default=10,
+                    help="Number of next frames to check for confirming the end of an untouched interval")
     parser.add_argument("--fps", type=int, default=30, help="Frames per second")
     parser.add_argument("--video_name", default="untouched_video_xyz.mp4", help="Output video name")
 
@@ -474,7 +477,8 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         start_time=args.start_time,
         ref_frame=args.ref_frame,
-        window=args.window,
+        p=args.p,
+        q=args.q,
         fps=args.fps,
         video_name=args.video_name,
         depth_csv=args.depth_csv,
