@@ -245,52 +245,41 @@ def analyze_untouched_objects_framewise(coms, bboxes, start_time, fps, p, q, dep
             cand_ymin = cy - ref_h / 2.0
             cand_ymax = cy + ref_h / 2.0
 
-            # Lookback: previous `window` frames must be evaluable & OK
             lookback_frames = list(range(f - p, f))
-            inside_ok = True
-            observed = 0
-            for pf in lookback_frames:
-                # We treat the lookback strictly by the original rules:
-                # - Missing COM is "inside" by position, BUT we still require depth; if depth missing → fail.
-                # - If COM present, it must lie inside cand bbox.
-                # - Depth must be present and within the allowed range.
-                # If pf < min_frame, fail (we can't satisfy a full lookback before the timeline).
-                if pf < min_frame:
-                    inside_ok = False
-                    break
+            valid_count = 0
+            total_detected = 0
 
-                depth_avail = (obj in depth_data and pf in depth_data[obj])
-                if not depth_avail:
-                    inside_ok = False
-                    break
-                z_pf = depth_data[obj][pf]
-                z_ok = depth_ok_for(obj, z_pf)
-                if not z_ok:
-                    inside_ok = False
-                    break
+            for pf in lookback_frames:
+                if pf < min_frame:
+                    continue  # ignore frames before start of video
 
                 xy_pf = com_dict.get(pf, None)
-                if xy_pf is not None:
-                    px, py = xy_pf
-                    if not (cand_xmin <= px <= cand_xmax and cand_ymin <= py <= cand_ymax):
-                        inside_ok = False
-                        break
+                depth_avail = (obj in depth_data and pf in depth_data[obj])
 
-                observed += 1  # count frames we checked
+                # Only consider frames where both COM and depth are available
+                if xy_pf is None or not depth_avail:
+                    continue
 
-            if inside_ok and observed == p:
-                # Start interval. x_start matches your previous behavior:
-                # max(start_frame, first lookback frame) if exist, else f.
+                total_detected += 1
+                z_pf = depth_data[obj][pf]
+                if not depth_ok_for(obj, z_pf):
+                    continue
+
+                px, py = xy_pf
+                if (cand_xmin <= px <= cand_xmax) and (cand_ymin <= py <= cand_ymax):
+                    valid_count += 1
+
+            # Decision: start interval if at least half of previous `p` frames meet criteria
+            if valid_count >= (p // 2):
                 x_start = max(start_frame, lookback_frames[0]) if lookback_frames else f
                 state[obj].update(
                     interval_active=True,
                     bbox=(cand_xmin, cand_ymin, cand_xmax, cand_ymax),
                     x_start=x_start,
-                    last_good=f,          # current frame itself is good by definition (starts extension)
+                    last_good=f,
                     check_start=None,
                     consec_bad=0
                 )
-                # Note: we don't append anything now; we’ll finalize when it ends.
 
     # ---- Finalize: if any interval remains open at the end, close it safely ----
     for obj, st in state.items():
