@@ -488,11 +488,11 @@ def render_overlay_video(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (full_w, full_h))
 
-    # circle legend placement (full-frame coords)
+    # circle legend placement (full-frame coords) — VERTICAL STACK
     circle_radius = 8
-    start_x = 20
-    spacing = 50
-    baseline_y = 40  # y for legend circles
+    start_x = 20            # fixed x for the column
+    start_y = 60            # first circle y (kept clear of "Frame:" text)
+    vspacing = 28           # vertical spacing between rows
     font = cv2.FONT_HERSHEY_SIMPLEX
 
     it = frame_files if no_progress else tqdm(frame_files, desc="Rendering overlay video", unit="frame")
@@ -551,8 +551,8 @@ def render_overlay_video(
 
         # --- Draw per-object state circles --- (use untouched_out/checking_out spans)
         for i, obj in enumerate(objects):
-            cx = start_x + i * spacing
-            cy = baseline_y
+            cx = start_x
+            cy = start_y + i * vspacing
             color = COLOR_MAP[obj]
 
             # Determine state for this frame
@@ -566,9 +566,9 @@ def render_overlay_video(
             else:
                 cv2.circle(overlay, (cx, cy), circle_radius, color, 2)   # empty = moving
 
-            # Optional: label below circle
-            cv2.putText(overlay, obj, (cx - 24, cy + 24),
-                        font, 0.4, color, 1, cv2.LINE_AA)
+            # Label to the RIGHT of the circle (horizontal text)
+            cv2.putText(overlay, obj, (cx + circle_radius + 8, cy + 5),
+                        font, 0.5, color, 1, cv2.LINE_AA)
 
         out.write(overlay)
 
