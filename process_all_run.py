@@ -317,8 +317,10 @@ class UntouchedState:
         self.bbox = None           # (xmin,ymin,xmax,ymax) fixed during active interval
         self.x_start = None
         self.last_good = None
-        self.check_start = None
-        self.consec_bad = 0
+        # Fixed-bucket checking state
+        self.check_start = None    # int or None
+        self.check_end = None      # int or None  (inclusive)
+        self.saw_any_bad = False   # True if at least one evaluable bad seen inside bucket
         self.ref_wh = None         # (w_ref, h_ref)
 
 def update_untouched_states(
@@ -343,49 +345,82 @@ def update_untouched_states(
 
         # ---------------- ACTIVE INTERVAL ----------------
         if st.interval_active:
-            # --- NEW: Occlusion handling ---
-            # If COM or Z is missing, treat as "still inside" during untouched,
-            # and "hold" the checking window if we're already in checking.
-            if xy is None or z is None:
-                if st.check_start is None:
-                    # Still untouched → extend solid interval through occlusion
-                    st.last_good = fnum
+            # If a checking bucket is open, manage the fixed window first
+            if st.check_start is not None and st.check_end is not None:
+                # We are inside/around a fixed checking bucket
+                if fnum <= st.check_end:
+                    # Still inside the bucket
+                    if xy is not None and z is not None:
+                        cx, cy = xy
+                        xmin, ymin, xmax, ymax = st.bbox
+                        inside = (xmin <= cx <= xmax) and (ymin <= cy <= ymax)
+                        z_ok   = depth_ok_for(obj, z)
+
+                        if inside and z_ok:
+                            # Immediate recovery: close checking, continue untouched
+                            checking_out[obj].append([st.check_start, fnum - 1])
+                            st.check_start = None
+                            st.check_end = None
+                            st.saw_any_bad = False
+                            st.last_good = fnum
+                        else:
+                            # evaluable & bad → mark bad inside bucket
+                            st.saw_any_bad = True
+                            # keep waiting until bucket ends
+                    else:
+                        # unevaluable inside bucket → do nothing
+                        pass
+
                 else:
-                    # Already in checking → keep it open, but do NOT bad++
-                    # (i.e., stay semi-transparent, don't jump to empty)
-                    pass
+                    # fnum just moved PAST the bucket end → finalize decision
+                    if st.saw_any_bad:
+                        # End untouched interval (no recovery happened)
+                        end_frame = st.last_good if st.last_good is not None else (st.x_start - 1)
+                        if end_frame is not None and st.x_start is not None and end_frame >= st.x_start:
+                            untouched_out[obj].append([st.x_start-p, end_frame])
+                        # record checking span up to fixed end
+                        checking_out[obj].append([st.check_start, st.check_end])
+                        # reset all
+                        st.interval_active = False
+                        st.bbox = None
+                        st.x_start = None
+                        st.last_good = None
+                        st.check_start = None
+                        st.check_end = None
+                        st.saw_any_bad = False
+                    else:
+                        # No evaluable bad at all in bucket → keep untouched ongoing
+                        checking_out[obj].append([st.check_start, st.check_end])
+                        st.check_start = None
+                        st.check_end = None
+                        st.saw_any_bad = False
+                        # We can extend last_good through this frame (benign)
+                        st.last_good = fnum
+
+                # After handling bucket, move to next object
                 continue
 
-            # Evaluable frame
+            # No open bucket → evaluate current frame
+            if xy is None or z is None:
+                # Unevaluable while untouched → treat as still fine; extend last_good
+                st.last_good = fnum
+                continue
+
+            # Evaluable frame while untouched
             cx, cy = xy
             xmin, ymin, xmax, ymax = st.bbox
             inside = (xmin <= cx <= xmax) and (ymin <= cy <= ymax)
             z_ok   = depth_ok_for(obj, z)
 
             if inside and z_ok:
+                # Keep untouched going
                 st.last_good = fnum
-                if st.check_start is not None:
-                    # Close the checking span on recovery
-                    checking_out[obj].append([st.check_start, fnum - 1])
-                    st.check_start = None
-                st.consec_bad = 0
             else:
-                # bad evaluable frame
-                if st.check_start is None:
-                    st.check_start = fnum
-                st.consec_bad += 1
-                if st.consec_bad >= q:
-                    end_frame = st.last_good if st.last_good is not None else (st.x_start - 1)
-                    if end_frame is not None and st.x_start is not None and end_frame >= st.x_start:
-                        untouched_out[obj].append([st.x_start, end_frame])
-                    checking_out[obj].append([st.check_start, fnum])
-                    # reset state
-                    st.interval_active = False
-                    st.bbox = None
-                    st.x_start = None
-                    st.last_good = None
-                    st.check_start = None
-                    st.consec_bad = 0
+                # First bad evaluable → open fixed checking bucket
+                st.check_start = fnum
+                st.check_end = fnum + q - 1  # inclusive
+                st.saw_any_bad = True  # this first frame is a bad-evaluable
+
             continue
         # -------------- END ACTIVE INTERVAL --------------
 
@@ -396,6 +431,7 @@ def update_untouched_states(
             continue
         if st.ref_wh is None:
             continue
+        # (start logic is handled in the main loop's warmup)
         continue
 
 # --- Helper for semi-transparent drawing ---
@@ -430,10 +466,10 @@ def render_overlay_video(
 
     # color map (BGR)
     COLOR_MAP = {
-        "red":      (0, 255, 0),
-        "green":    (0, 0, 255),
-        "gray":     (0, 255, 255),
-        "yellow_1": (255, 0, 0),
+        "red":      (0, 0, 255),
+        "green":    (0, 255, 0),
+        "gray":     (255, 255, 255),
+        "yellow_1": (0, 255, 255),
         "yellow_2": (0, 128, 255),
         "gold":     (128, 0, 255),
     }
@@ -511,7 +547,7 @@ def render_overlay_video(
 
         # --- Draw frame number ---
         frame_label = f"Frame: {frame_idx}" if frame_idx is not None else fname
-        cv2.putText(overlay, frame_label, (10, 25), font, 0.6, (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(overlay, frame_label, (10, 25), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
         # --- Draw per-object state circles --- (use untouched_out/checking_out spans)
         for i, obj in enumerate(objects):
@@ -808,11 +844,35 @@ def main():
         last_frame = parse_frame_num(color_files[-1]) or 0
         for obj, st in states.items():
             if st.interval_active:
-                if st.check_start is not None and st.last_good is not None and st.check_start <= st.last_good:
-                    checking_out[obj].append([st.check_start, st.last_good])
-                end_frame = st.last_good if st.last_good is not None else (st.x_start - 1 if st.x_start else last_frame)
-                if st.x_start is not None and end_frame is not None and end_frame >= st.x_start:
-                    untouched_out[obj].append([st.x_start, end_frame])
+                # If a fixed bucket is still open at the file end, clamp and decide
+                if st.check_start is not None and st.check_end is not None:
+                    # Clamp the bucket end to the video end
+                    bucket_end = min(st.check_end, last_frame)
+                    if st.saw_any_bad:
+                        end_frame = st.last_good if st.last_good is not None else (st.x_start - 1 if st.x_start else bucket_end)
+                        if st.x_start is not None and end_frame is not None and end_frame >= st.x_start:
+                            untouched_out[obj].append([st.x_start-args.p, end_frame])
+                        checking_out[obj].append([st.check_start, bucket_end])
+                        # reset interval
+                        st.interval_active = False
+                        st.bbox = None
+                        st.x_start = None
+                        st.last_good = None
+                    else:
+                        # benign bucket → keep untouched through last video frame
+                        checking_out[obj].append([st.check_start, bucket_end])
+                        # extend last_good as benign
+                        st.last_good = last_frame
+
+                    st.check_start = None
+                    st.check_end = None
+                    st.saw_any_bad = False
+
+                # Commit any still-open untouched interval
+                if st.interval_active:
+                    end_frame = st.last_good if st.last_good is not None else (st.x_start - 1 if st.x_start else last_frame)
+                    if st.x_start is not None and end_frame is not None and end_frame >= st.x_start:
+                        untouched_out[obj].append([st.x_start-args.p, end_frame])
 
     # Write untouched_intervals_xyz.txt
     out_txt = os.path.join(args.out_dir, "untouched_intervals_xyz.txt")
